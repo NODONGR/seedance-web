@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Seedance 2.0 · Workspace</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">●</span>
+      <h1>Seedance 2.0 <span class="muted">Workspace</span></h1>
+    </div>
+    <div id="health" class="health muted small"></div>
+    <div class="topbar-actions">
+      <button id="submit" class="primary">▶ 큐에 추가 & 생성</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+
+    <aside class="panel panel-left">
+      <section class="card">
+        <h2>모드</h2>
+        <div class="seg">
+          <label><input type="radio" name="mode" value="reference" checked /><span>다중 레퍼런스</span></label>
+          <label><input type="radio" name="mode" value="frame" /><span>First / Last Frame</span></label>
+        </div>
+        <p class="muted xsmall">두 모드는 동시 사용 불가 (API 제약).</p>
+      </section>
+
+      <section class="card">
+        <h2>프롬프트</h2>
+        <textarea id="prompt" rows="5" placeholder="원하는 영상을 묘사하세요. @image1, @video1 처럼 레퍼런스를 가리킬 수 있습니다."></textarea>
+        <details>
+          <summary>네거티브 프롬프트</summary>
+          <textarea id="negative_prompt" rows="2" placeholder="제외할 요소"></textarea>
+        </details>
+      </section>
+
+      <section class="card" id="reference-section">
+        <h2>레퍼런스 <span class="muted xsmall">(이미지 9 · 영상 3)</span></h2>
+        <div class="row">
+          <button id="add-ref-image">+ 이미지</button>
+          <button id="add-ref-video">+ 영상</button>
+        </div>
+        <div id="ref-list" class="ref-grid"></div>
+      </section>
+
+      <section class="card hidden" id="frame-section">
+        <h2>First / Last Frame</h2>
+        <div class="frame-grid">
+          <div class="frame-slot">
+            <h3>First Frame <span class="muted xsmall">(필수)</span></h3>
+            <div class="slot-body" data-role="first_frame"></div>
+          </div>
+          <div class="frame-slot">
+            <h3>Last Frame <span class="muted xsmall">(선택)</span></h3>
+            <div class="slot-body" data-role="last_frame"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>출력 설정</h2>
+        <div class="grid-2">
+          <label>모델
+            <select id="model">
+              <option value="standard">Standard</option>
+              <option value="fast">Fast</option>
+            </select>
+          </label>
+          <label>해상도
+            <select id="resolution">
+              <option>480p</option>
+              <option selected>720p</option>
+              <option>1080p</option>
+            </select>
+          </label>
+          <label>비율
+            <select id="ratio">
+              <option>16:9</option>
+              <option>9:16</option>
+              <option>1:1</option>
+              <option>4:3</option>
+              <option>3:4</option>
+              <option>21:9</option>
+            </select>
+          </label>
+          <label>길이(초)
+            <input id="duration" type="number" min="4" max="15" value="5" />
+          </label>
+          <label>Seed
+            <input id="seed" type="number" placeholder="(자동)" />
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check"><input id="generate_audio" type="checkbox" /> 오디오</label>
+          <label class="check"><input id="return_last_frame" type="checkbox" /> 마지막 프레임</label>
+          <label class="check"><input id="watermark" type="checkbox" /> 워터마크</label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>업로드 방식</h2>
+        <div class="seg">
+          <label><input type="radio" name="upload_mode" value="data_uri" checked /><span>Data URI</span></label>
+          <label><input type="radio" name="upload_mode" value="public_url" /><span>Public URL</span></label>
+        </div>
+        <p class="muted xsmall">큰 파일은 Public URL + 터널 권장.</p>
+      </section>
+    </aside>
+
+    <main class="panel panel-main">
+      <section class="viewport" id="viewport">
+        <div class="viewport-placeholder" id="result-placeholder">
+          <div class="ph-icon">▶</div>
+          <div class="ph-text">생성된 영상이 여기에 표시됩니다</div>
+          <div class="ph-sub muted small">왼쪽에서 설정 후 상단 버튼을 누르면 우측 큐에 작업이 추가됩니다.</div>
+        </div>
+        <div class="viewport-result" id="result-card">
+          <video id="result-video" controls></video>
+          <div class="result-meta">
+            <span id="selected-info" class="muted xsmall mono"></span>
+            <a id="result-link" target="_blank"></a>
+            <a id="result-download" class="dl">⤓ 다운로드</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="status-bar" id="status-card">
+        <div class="status-header">
+          <h2>이벤트 로그</h2>
+          <span id="task-id" class="muted xsmall mono"></span>
+        </div>
+        <div id="status" class="status-log"></div>
+        <details class="raw-wrap">
+          <summary>Raw 응답</summary>
+          <pre id="raw" class="raw"></pre>
+        </details>
+      </section>
+    </main>
+
+    <aside class="panel panel-right">
+      <div class="queue-header">
+        <h2>작업 큐 <span id="queue-count" class="count">0</span></h2>
+        <div class="queue-actions">
+          <button id="clear-completed" title="완료/실패 항목 정리">정리</button>
+          <button id="clear-all" class="danger" title="전체 삭제">전부 지우기</button>
+        </div>
+      </div>
+      <div class="queue-tabs">
+        <label><input type="radio" name="qtab" value="all" checked /><span>전체</span></label>
+        <label><input type="radio" name="qtab" value="active" /><span>진행 중</span></label>
+        <label><input type="radio" name="qtab" value="done" /><span>완료</span></label>
+      </div>
+      <div class="queue-list" id="queue-list"></div>
+      <div class="queue-empty muted small" id="queue-empty">제출한 작업이 여기에 표시됩니다.</div>
+    </aside>
+
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
