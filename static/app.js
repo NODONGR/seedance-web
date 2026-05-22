@@ -7,15 +7,37 @@ const queueList = $("queue-list");
 const queueEmpty = $("queue-empty");
 
 const STORAGE_KEY = "seedance.jobs.v1";
+const PROMPTS_KEY = "seedance.prompts.v1";
 const MAX_JOBS = 50;
 const POLL_INTERVAL_MS = 4000;
+const SAVE_DEBOUNCE_MS = 600;
+const RENDER_DEBOUNCE_MS = 120;
 
 /** @type {Map<string, {timeout:number}>} */
 const pollers = new Map();
 /** @type {Array<Job>} */
 let jobs = loadJobs();
+let staticPrompts = loadPrompts();
 let selectedJobId = null;
 let queueTab = "all";
+
+// Debounce timers to reduce localStorage writes and DOM re-renders during heavy polling.
+let saveTimer = null;
+let renderTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveJobs();
+  }, SAVE_DEBOUNCE_MS);
+}
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => {
+    renderTimer = null;
+    renderQueue();
+  }, RENDER_DEBOUNCE_MS);
+}
 
 // ---------- Storage ----------
 
@@ -31,9 +53,32 @@ function loadJobs() {
 }
 function saveJobs() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs.slice(0, MAX_JOBS)));
+    // Strip large raw payloads before persisting to avoid bloating localStorage.
+    const slim = jobs.slice(0, MAX_JOBS).map((j) => ({
+      ...j,
+      raw: j.raw && isTerminal(j.status) ? j.raw : null,
+    }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
   } catch (e) {
     console.warn("localStorage write failed", e);
+  }
+}
+
+function loadPrompts() {
+  try {
+    const raw = localStorage.getItem(PROMPTS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+function savePrompts() {
+  try {
+    localStorage.setItem(PROMPTS_KEY, JSON.stringify(staticPrompts));
+  } catch (e) {
+    console.warn("prompt storage write failed", e);
   }
 }
 
@@ -84,7 +129,7 @@ function pickFile(accept) {
 
 // ---------- Reference items ----------
 
-function addRefItem(kind) {
+function addRefItem(kind, prefill) {
   const wrap = document.createElement("div");
   wrap.className = "ref-item";
   wrap.dataset.kind = kind;
@@ -102,6 +147,14 @@ function addRefItem(kind) {
   `;
   refList.appendChild(wrap);
 
+  if (prefill && prefill.url) {
+    const ct = prefill.contentType || (kind === "image" ? "image/*" : "video/*");
+    wrap.dataset.url = prefill.url;
+    wrap.dataset.contentType = ct;
+    wrap.querySelector(".thumb").innerHTML = previewMedia(prefill.url, ct);
+    wrap.querySelector(".filename").textContent = prefill.label || "복원됨";
+  }
+
   wrap.querySelector(".upload").addEventListener("click", async () => {
     const accept = kind === "image" ? "image/*" : "video/*";
     const file = await pickFile(accept);
@@ -117,6 +170,7 @@ function addRefItem(kind) {
     }
   });
   wrap.querySelector(".remove").addEventListener("click", () => wrap.remove());
+  return wrap;
 }
 
 $("add-ref-image").addEventListener("click", () => addRefItem("image"));
@@ -232,15 +286,23 @@ function jobLog(job, text, level = "") {
   job.events.unshift({ ts: Date.now(), text, level });
   if (job.events.length > 40) job.events.length = 40;
   job.lastUpdate = Date.now();
-  saveJobs();
+  scheduleSave();
   if (selectedJobId === job.id) renderStatus(job);
-  renderQueue();
+  scheduleRender();
+}
+
+// Lightweight update path: bump lastUpdate without spawning a new log row.
+// Used by polling when status hasn't changed, so we don't flood events[] or
+// trigger full re-renders on every tick.
+function jobTouch(job) {
+  job.lastUpdate = Date.now();
+  scheduleSave();
+  scheduleRender();
 }
 
 // ---------- Submit ----------
 
-$("submit").addEventListener("click", async () => {
-  const payload = buildPayloadFromForm();
+async function submitJob(payload, initialNote) {
   const job = {
     id: makeJobId(),
     taskId: "",
@@ -252,7 +314,7 @@ $("submit").addEventListener("click", async () => {
     thumbnailUrl: null,
     payload,
     raw: null,
-    events: [{ ts: Date.now(), text: "요청 전송 중", level: "status-running" }],
+    events: [{ ts: Date.now(), text: initialNote || "요청 전송 중", level: "status-running" }],
   };
   jobs.unshift(job);
   if (jobs.length > MAX_JOBS) jobs.length = MAX_JOBS;
@@ -271,13 +333,13 @@ $("submit").addEventListener("click", async () => {
     if (!r.ok) {
       job.status = "failed";
       jobLog(job, "요청 실패: " + (resp.detail || JSON.stringify(resp)), "status-failed");
-      return;
+      return job;
     }
     job.taskId = resp.task_id || "";
     if (!job.taskId) {
       job.status = "failed";
       jobLog(job, "task_id 누락. Raw 응답 확인.", "status-failed");
-      return;
+      return job;
     }
     job.status = "queued";
     jobLog(job, `작업 생성됨 · ${job.taskId}`, "status-running");
@@ -286,6 +348,11 @@ $("submit").addEventListener("click", async () => {
     job.status = "failed";
     jobLog(job, "네트워크 에러: " + e.message, "status-failed");
   }
+  return job;
+}
+
+$("submit").addEventListener("click", () => {
+  submitJob(buildPayloadFromForm());
 });
 
 // ---------- Polling ----------
@@ -298,7 +365,6 @@ function startPolling(job) {
     try {
       const r = await fetch(`/api/task/${job.taskId}`);
       const data = await r.json();
-      job.raw = data;
       const status = data.status || data.state || data.data?.status || "running";
       const videoUrl =
         data?.content?.video_url ||
@@ -306,17 +372,31 @@ function startPolling(job) {
         data?.data?.video_url ||
         data?.result?.video_url || null;
 
+      const prevStatus = job.status;
+      const becameTerminal = isTerminal(status) && !isTerminal(prevStatus);
+      // Only retain raw payload on status transitions or terminal states to
+      // keep storage small while preserving the final API response for debugging.
+      if (status !== prevStatus || becameTerminal) {
+        job.raw = data;
+      }
       job.status = status;
       if (videoUrl) {
         job.videoUrl = videoUrl;
         job.thumbnailUrl = videoUrl;
       }
-      jobLog(job, `#${attempts} ${status}`, isTerminal(status) ? (status === "succeeded" ? "status-succeeded" : "status-failed") : "status-running");
+
+      if (status !== prevStatus) {
+        const lvl = isTerminal(status) ? (status === "succeeded" ? "status-succeeded" : "status-failed") : "status-running";
+        jobLog(job, `상태: ${status} (#${attempts})`, lvl);
+      } else {
+        // No status change — just bump timestamps and let debounced render catch up.
+        jobTouch(job);
+      }
 
       if (isTerminal(status) || videoUrl) {
         if (videoUrl && selectedJobId === job.id) loadJobIntoViewport(job);
         pollers.delete(job.id);
-        return;
+        if (isTerminal(status)) return;
       }
     } catch (e) {
       jobLog(job, "폴링 에러: " + e.message, "status-failed");
@@ -333,6 +413,162 @@ function stopPolling(jobId) {
   if (p && p.timeout) clearTimeout(p.timeout);
   pollers.delete(jobId);
 }
+
+// ---------- Restore / Rerun ----------
+
+function clearReferenceUI() {
+  refList.innerHTML = "";
+  document.querySelectorAll(".slot-body").forEach((slot) => {
+    slot.innerHTML = "";
+    slot.classList.add("empty");
+    delete slot.dataset.url;
+    delete slot.dataset.contentType;
+  });
+}
+
+function setMode(modeName) {
+  const radio = document.querySelector(`input[name="mode"][value="${modeName}"]`);
+  if (!radio) return;
+  radio.checked = true;
+  if (modeName === "reference") {
+    refSection.classList.remove("hidden");
+    frameSection.classList.add("hidden");
+  } else {
+    refSection.classList.add("hidden");
+    frameSection.classList.remove("hidden");
+  }
+}
+
+function restoreFrameSlot(slot, url) {
+  slot.dataset.url = url;
+  slot.classList.remove("empty");
+  slot.innerHTML = `
+    <div class="uploaded">
+      <img src="${url}" alt="" />
+      <div class="meta">복원됨</div>
+      <button class="clear">제거</button>
+    </div>`;
+  slot.querySelector(".clear").addEventListener("click", (e) => {
+    e.stopPropagation();
+    slot.innerHTML = "";
+    slot.classList.add("empty");
+    delete slot.dataset.url;
+  });
+}
+
+function restoreJobSettings(job) {
+  const p = job.payload || {};
+  $("prompt").value = p.prompt || "";
+  $("negative_prompt").value = p.negative_prompt || "";
+  $("model").value = p.model || "standard";
+  $("resolution").value = p.resolution || "720p";
+  $("ratio").value = p.ratio || "16:9";
+  $("duration").value = p.duration ?? 5;
+  $("seed").value = p.seed == null ? "" : p.seed;
+  $("generate_audio").checked = !!p.generate_audio;
+  $("return_last_frame").checked = !!p.return_last_frame;
+  $("watermark").checked = !!p.watermark;
+
+  clearReferenceUI();
+  const refs = Array.isArray(p.references) ? p.references : [];
+  const hasFrame = refs.some((r) => r.role === "first_frame" || r.role === "last_frame");
+  setMode(hasFrame ? "frame" : "reference");
+
+  if (hasFrame) {
+    for (const ref of refs) {
+      const slot = document.querySelector(`.slot-body[data-role="${ref.role}"]`);
+      if (slot && ref.url) restoreFrameSlot(slot, ref.url);
+    }
+  } else {
+    for (const ref of refs) {
+      if (!ref.url) continue;
+      addRefItem(ref.kind, { url: ref.url, contentType: ref.kind === "image" ? "image/*" : "video/*", label: "복원됨" });
+    }
+  }
+  // Scroll the form to the top so the user sees what was restored.
+  document.querySelector(".panel-left")?.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function rerunJob(originalJob) {
+  if (!originalJob) return;
+  const payload = JSON.parse(JSON.stringify(originalJob.payload || {}));
+  const note = `재실행 (원본 ${truncateTaskId(originalJob.taskId) || originalJob.id})`;
+  submitJob(payload, note);
+}
+
+// ---------- Static prompts ----------
+
+function renderStaticPrompts() {
+  const wrap = $("static-prompts");
+  const empty = $("static-prompts-empty");
+  if (!wrap) return;
+  if (!staticPrompts.length) {
+    wrap.innerHTML = "";
+    if (empty) empty.style.display = "block";
+    return;
+  }
+  if (empty) empty.style.display = "none";
+  wrap.innerHTML = staticPrompts
+    .map((p) => `
+      <div class="sp-item" data-id="${p.id}" title="${escapeHtml(p.text)}">
+        <button class="sp-apply" data-id="${p.id}" title="현재 프롬프트로 교체">${escapeHtml(p.name)}</button>
+        <button class="sp-append" data-id="${p.id}" title="현재 프롬프트 끝에 추가">+</button>
+        <button class="sp-remove" data-id="${p.id}" title="삭제">×</button>
+      </div>
+    `)
+    .join("");
+}
+
+function addStaticPrompt() {
+  const text = $("prompt").value.trim();
+  if (!text) {
+    alert("저장할 프롬프트를 먼저 입력하세요.");
+    return;
+  }
+  const defaultName = text.slice(0, 24);
+  const name = window.prompt("프롬프트 이름:", defaultName);
+  if (name == null) return;
+  const trimmed = name.trim() || defaultName;
+  staticPrompts.unshift({
+    id: Math.random().toString(36).slice(2, 10),
+    name: trimmed,
+    text,
+    createdAt: Date.now(),
+  });
+  savePrompts();
+  renderStaticPrompts();
+}
+
+function applyStaticPrompt(id, mode) {
+  const p = staticPrompts.find((x) => x.id === id);
+  if (!p) return;
+  const box = $("prompt");
+  if (mode === "append") {
+    const cur = box.value;
+    box.value = cur ? `${cur.trimEnd()}\n${p.text}` : p.text;
+  } else {
+    box.value = p.text;
+  }
+  box.focus();
+}
+
+function removeStaticPrompt(id) {
+  staticPrompts = staticPrompts.filter((p) => p.id !== id);
+  savePrompts();
+  renderStaticPrompts();
+}
+
+$("save-prompt-btn")?.addEventListener("click", addStaticPrompt);
+$("static-prompts")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (btn.classList.contains("sp-apply")) applyStaticPrompt(id, "apply");
+  else if (btn.classList.contains("sp-append")) applyStaticPrompt(id, "append");
+  else if (btn.classList.contains("sp-remove")) {
+    if (confirm("이 프롬프트를 삭제할까요?")) removeStaticPrompt(id);
+  }
+});
 
 // ---------- Selection / viewport / status ----------
 
@@ -420,10 +656,24 @@ function renderQueue() {
   queueEmpty.style.display = filtered.length ? "none" : "block";
   queueList.innerHTML = filtered
     .map((job) => {
-      const thumb = job.videoUrl
-        ? `<video src="${job.videoUrl}" muted></video>`
-        : (isTerminal(job.status) && job.status !== "succeeded" ? "✕" : "▣");
+      // Avoid <video preload="auto"> on queue thumbs — with many items it
+      // spawns a video decoder + network fetch per row and is the main lag source.
+      let thumb;
+      if (job.videoUrl) {
+        thumb = `<video src="${job.videoUrl}" muted preload="none" playsinline></video><span class="q-play">▶</span>`;
+      } else if (isTerminal(job.status) && job.status !== "succeeded") {
+        thumb = "✕";
+      } else {
+        thumb = "▣";
+      }
       const title = (job.prompt || "(no prompt)").trim() || "(no prompt)";
+      const terminal = isTerminal(job.status);
+      const actionsHtml = terminal
+        ? `<div class="q-actions">
+             <button class="q-rerun" data-id="${job.id}" title="동일 설정으로 다시 실행">⟳ 재실행</button>
+             <button class="q-restore" data-id="${job.id}" title="이 작업의 설정을 폼에 불러오기">↩ 불러오기</button>
+           </div>`
+        : "";
       return `
         <div class="q-item ${job.id === selectedJobId ? "selected" : ""}" data-id="${job.id}">
           <div class="q-thumb">${thumb}</div>
@@ -434,25 +684,40 @@ function renderQueue() {
               <span>${formatAgo(job.createdAt)} 전</span>
               <span class="mono">${truncateTaskId(job.taskId) || ""}</span>
             </div>
+            ${actionsHtml}
           </div>
           <button class="q-remove" data-id="${job.id}" title="삭제">×</button>
         </div>`;
     })
     .join("");
-
-  queueList.querySelectorAll(".q-item").forEach((el) => {
-    el.addEventListener("click", (e) => {
-      if (e.target.classList.contains("q-remove")) return;
-      selectJob(el.dataset.id);
-    });
-  });
-  queueList.querySelectorAll(".q-remove").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      removeJob(btn.dataset.id);
-    });
-  });
 }
+
+// Event delegation on the queue container — one listener instead of N per render.
+queueList.addEventListener("click", (e) => {
+  const target = e.target;
+  if (!(target instanceof HTMLElement)) return;
+  const item = target.closest(".q-item");
+  if (!item) return;
+  const id = item.dataset.id;
+
+  if (target.closest(".q-remove")) {
+    e.stopPropagation();
+    removeJob(id);
+    return;
+  }
+  if (target.closest(".q-rerun")) {
+    e.stopPropagation();
+    rerunJob(jobs.find((j) => j.id === id));
+    return;
+  }
+  if (target.closest(".q-restore")) {
+    e.stopPropagation();
+    const job = jobs.find((j) => j.id === id);
+    if (job) restoreJobSettings(job);
+    return;
+  }
+  selectJob(id);
+});
 
 function removeJob(id) {
   stopPolling(id);
@@ -498,6 +763,8 @@ setInterval(() => { if (jobs.length) renderQueue(); }, 15000);
   } catch {
     $("health").textContent = "백엔드 응답 없음";
   }
+
+  renderStaticPrompts();
 
   // Resume polling for non-terminal jobs from previous session
   jobs.forEach((j) => {
